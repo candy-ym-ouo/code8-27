@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { AppError } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
@@ -17,47 +18,63 @@ export const exportRoutes: FastifyPluginAsync = async (app) => {
     const includeDeleted = String(query.includeDeleted ?? 'false').toLowerCase() === 'true';
     const filter = notDeletedFilter(includeDeleted);
 
-    const [booksCount, dogEarsCount, annotationsCount, rereadCount, reflectionsCount, eventsCount] =
-      await Promise.all([
-        prisma.book.count({ where: { userId, ...filter } }),
-        prisma.dogEar.count({ where: { userId, ...filter } }),
-        prisma.annotation.count({ where: { userId, ...filter } }),
-        prisma.rereadMark.count({ where: { userId, ...filter } }),
-        prisma.completionReflection.count({ where: { userId, ...filter } }),
-        prisma.activityEvent.count({ where: { userId } })
-      ]);
-    const totalRows =
-      booksCount + dogEarsCount + annotationsCount + rereadCount + reflectionsCount + eventsCount;
-    if (totalRows > env.EXPORT_MAX_ROWS) {
-      throw new AppError(413, 'EXPORT_TOO_LARGE', `导出数据超过 ${env.EXPORT_MAX_ROWS} 行限制`);
-    }
+    // 行数上限检查与导出内容必须来自同一快照，
+    // 否则并发写入会让“检查过的存量”与“实际导出的口径”分叉。
+    const snapshot = await prisma.$transaction(
+      async (tx) => {
+        const booksCount = await tx.book.count({ where: { userId, ...filter } });
+        const dogEarsCount = await tx.dogEar.count({ where: { userId, ...filter } });
+        const annotationsCount = await tx.annotation.count({ where: { userId, ...filter } });
+        const rereadCount = await tx.rereadMark.count({ where: { userId, ...filter } });
+        const reflectionsCount = await tx.completionReflection.count({ where: { userId, ...filter } });
+        const eventsCount = await tx.activityEvent.count({ where: { userId } });
+        const totalRows =
+          booksCount + dogEarsCount + annotationsCount + rereadCount + reflectionsCount + eventsCount;
+        if (totalRows > env.EXPORT_MAX_ROWS) {
+          throw new AppError(413, 'EXPORT_TOO_LARGE', `导出数据超过 ${env.EXPORT_MAX_ROWS} 行限制`);
+        }
 
-    const [user, books, dogEars, annotations, rereadMarks, reflections, activityEvents] = await Promise.all([
-      prisma.user.findUniqueOrThrow({ where: { id: userId } }),
-      prisma.book.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
-      prisma.dogEar.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
-      prisma.annotation.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
-      prisma.rereadMark.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
-      prisma.completionReflection.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
-      prisma.activityEvent.findMany({ where: { userId }, orderBy: { occurredAt: 'asc' } })
-    ]);
+        const user = await tx.user.findUniqueOrThrow({ where: { id: userId } });
+        const books = await tx.book.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } });
+        const dogEars = await tx.dogEar.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } });
+        const annotations = await tx.annotation.findMany({
+          where: { userId, ...filter },
+          orderBy: { createdAt: 'asc' }
+        });
+        const rereadMarks = await tx.rereadMark.findMany({
+          where: { userId, ...filter },
+          orderBy: { createdAt: 'asc' }
+        });
+        const reflections = await tx.completionReflection.findMany({
+          where: { userId, ...filter },
+          orderBy: { createdAt: 'asc' }
+        });
+        const activityEvents = await tx.activityEvent.findMany({
+          where: { userId },
+          orderBy: { occurredAt: 'asc' }
+        });
+        return { user, books, dogEars, annotations, rereadMarks, reflections, activityEvents };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 30_000 }
+    );
+
     const exportedAt = new Date();
     const payload = {
       schemaVersion: 1,
       exportedAt: exportedAt.toISOString(),
       includeDeleted,
       user: {
-        id: user.id,
-        email: user.email,
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt
+        id: snapshot.user.id,
+        email: snapshot.user.email,
+        createdAt: snapshot.user.createdAt,
+        updatedAt: snapshot.user.updatedAt
       },
-      books,
-      dogEars,
-      annotations,
-      rereadMarks,
-      reflections,
-      activityEvents
+      books: snapshot.books,
+      dogEars: snapshot.dogEars,
+      annotations: snapshot.annotations,
+      rereadMarks: snapshot.rereadMarks,
+      reflections: snapshot.reflections,
+      activityEvents: snapshot.activityEvents
     };
     const date = exportedAt.toISOString().slice(0, 10);
     reply

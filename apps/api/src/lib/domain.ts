@@ -79,8 +79,24 @@ export function normalizeMoodTags(tags: MoodTag[]): MoodTag[] {
   return unique;
 }
 
+export const RESTORE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 export function isRestoreWindowOpen(deletedAt: Date | null, now = new Date()): boolean {
-  return Boolean(deletedAt && now.getTime() - deletedAt.getTime() <= 24 * 60 * 60 * 1000);
+  return Boolean(deletedAt && now.getTime() - deletedAt.getTime() <= RESTORE_WINDOW_MS);
+}
+
+export function restoreWindowStart(now = new Date()): Date {
+  return new Date(now.getTime() - RESTORE_WINDOW_MS);
+}
+
+export function assertRestorablePage(maxPage: number, pageCount: number | null): void {
+  if (pageCount !== null && maxPage > pageCount) {
+    throw new AppError(
+      409,
+      'PAGE_OUT_OF_RANGE',
+      `第 ${maxPage} 页超出当前总页数 ${pageCount}，请先调整总页数再恢复`
+    );
+  }
 }
 
 export function isStrictlyEditable(editableUntil: Date, now = new Date()): boolean {

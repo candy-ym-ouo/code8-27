@@ -5,7 +5,7 @@ import { BOOK_STATUSES, MOOD_TAGS, type BookStatus, type MoodTag } from '@paper-
 import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
-import { normalizeMoodTags, normalizeText, validateStatusTransition } from '../../lib/domain.js';
+import { normalizeMoodTags, normalizeText, restoreWindowStart, validateStatusTransition } from '../../lib/domain.js';
 import { writeEvent } from '../../lib/events.js';
 import { paginationFromQuery, parseId } from '../../lib/http.js';
 
@@ -136,12 +136,23 @@ function serializeBook(book: {
   };
 }
 
-async function maximumTracePage(userId: string, bookId: string): Promise<number> {
-  const [dogEar, annotation, reread] = await Promise.all([
-    prisma.dogEar.aggregate({ where: { userId, bookId, deletedAt: null }, _max: { pageNumber: true } }),
-    prisma.annotation.aggregate({ where: { userId, bookId, deletedAt: null }, _max: { endPage: true } }),
-    prisma.rereadMark.aggregate({ where: { userId, bookId, deletedAt: null }, _max: { pageNumber: true } })
-  ]);
+// 复算总页数边界：存活痕迹与 24 小时恢复窗口内仍可撤销的痕迹都占页码，
+// 防止“删除 -> 调小总页数 -> 撤销恢复”把页码约束打破。
+async function maximumTracePage(
+  tx: Prisma.TransactionClient,
+  userId: string,
+  bookId: string,
+  now = new Date()
+): Promise<number> {
+  const restorableSince = restoreWindowStart(now);
+  const visible = {
+    userId,
+    bookId,
+    OR: [{ deletedAt: null }, { deletedAt: { gte: restorableSince } }]
+  };
+  const dogEar = await tx.dogEar.aggregate({ where: visible, _max: { pageNumber: true } });
+  const annotation = await tx.annotation.aggregate({ where: visible, _max: { endPage: true } });
+  const reread = await tx.rereadMark.aggregate({ where: visible, _max: { pageNumber: true } });
   return Math.max(
     dogEar._max.pageNumber ?? 0,
     annotation._max.endPage ?? 0,
@@ -308,12 +319,7 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
     if (parsed.data.version && parsed.data.version !== existing.version) {
       throw new AppError(409, 'STALE_WRITE', '书目已在其他位置被修改，请刷新后重试');
     }
-    if (parsed.data.pageCount !== undefined && parsed.data.pageCount !== null) {
-      const maxPage = await maximumTracePage(userId, bookId);
-      if (parsed.data.pageCount < maxPage) {
-        throw new AppError(409, 'PAGE_COUNT_TOO_SMALL', `总页数不能小于已有痕迹的最大页码 ${maxPage}`);
-      }
-    }
+    const nextPageCount = parsed.data.pageCount;
 
     const data: Prisma.BookUpdateManyMutationInput = {};
     if (parsed.data.title !== undefined) data.title = normalizeText(parsed.data.title);
@@ -327,6 +333,18 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
     if (Object.keys(data).length === 0) return { book: serializeBook(existing) };
 
     const result = await prisma.$transaction(async (tx) => {
+      if (nextPageCount !== undefined && nextPageCount !== null) {
+        // 锁住书目行，与并发的痕迹写入/恢复互斥后，再按最新数据复算页码边界
+        await tx.$queryRaw`SELECT id FROM books WHERE id = ${bookId}::uuid AND user_id = ${userId}::uuid FOR UPDATE`;
+        const maxPage = await maximumTracePage(tx, userId, bookId);
+        if (nextPageCount < maxPage) {
+          throw new AppError(
+            409,
+            'PAGE_COUNT_TOO_SMALL',
+            `总页数不能小于已有痕迹的最大页码 ${maxPage}（含 24 小时内删除、仍可撤销的痕迹）`
+          );
+        }
+      }
       const updated = await tx.book.updateMany({
         where: { id: bookId, userId, deletedAt: null, version: existing.version },
         data: { ...data, version: { increment: 1 } }
@@ -452,6 +470,8 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
     const bookId = parseId((request.params as { bookId: string }).bookId, 'bookId');
     const userId = currentUser(request).id;
     await prisma.$transaction(async (tx) => {
+      // 与痕迹写入/恢复保持相同的加锁顺序（先书目行、后痕迹行），避免交叉死锁
+      await tx.$queryRaw`SELECT id FROM books WHERE id = ${bookId}::uuid AND user_id = ${userId}::uuid FOR UPDATE`;
       const book = await tx.book.findFirst({ where: { id: bookId, userId, deletedAt: null } });
       if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
       const existingVersion = (request.body as { version?: number } | undefined)?.version;
