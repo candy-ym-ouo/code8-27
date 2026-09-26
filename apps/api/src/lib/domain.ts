@@ -46,6 +46,22 @@ export function validateSinglePage(pageNumber: number, pageCount: number | null)
   }
 }
 
+export function assertPageCountCoversTraces(pageCount: number, maxTracePage: number): void {
+  if (pageCount < maxTracePage) {
+    throw new AppError(409, 'PAGE_COUNT_TOO_SMALL', `总页数不能小于已有痕迹的最大页码 ${maxTracePage}`);
+  }
+}
+
+export function assertRestorablePage(pageNumber: number, pageCount: number | null): void {
+  if (pageCount !== null && pageNumber > pageCount) {
+    throw new AppError(
+      409,
+      'PAGE_OUT_OF_RANGE',
+      `第 ${pageNumber} 页超出当前总页数 ${pageCount}，请先调整总页数后再恢复`
+    );
+  }
+}
+
 export function assertBookStatus(value: string): asserts value is BookStatus {
   if (!BOOK_STATUSES.includes(value as BookStatus)) {
     throw new AppError(422, 'VALIDATION_ERROR', '书目状态无效', { status: '书目状态无效' });

@@ -5,8 +5,9 @@ import { TRACE_TYPES, type TraceType } from '@paper-book-traces/shared';
 import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
-import { isRestoreWindowOpen, normalizeText, validatePageRange, validateSinglePage } from '../../lib/domain.js';
+import { isRestoreWindowOpen, normalizeText, assertRestorablePage, validatePageRange, validateSinglePage } from '../../lib/domain.js';
 import { writeEvent } from '../../lib/events.js';
+import { lockBookForUpdate } from '../../lib/page-bounds.js';
 import { optionalDate, paginationFromQuery, parseId } from '../../lib/http.js';
 
 const optionalReason = (max: number) =>
@@ -195,22 +196,24 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const parsed = dogEarCreateSchema.safeParse(request.body);
     if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '折角信息无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
-    const book = await prisma.book.findFirst({ where: { id: bookId, userId, deletedAt: null } });
-    if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
-    validateSinglePage(parsed.data.pageNumber, book.pageCount);
     const reason = parsed.data.reason ? normalizeText(parsed.data.reason) : null;
-    const existing = await prisma.dogEar.findFirst({
-      where: { bookId, pageNumber: parsed.data.pageNumber, deletedAt: null }
-    });
-    if (existing) {
-      if ((existing.reason ?? '') === (reason ?? '')) {
-        return reply.status(200).send({ dogEar: serializeDogEar(existing), idempotent: true });
-      }
-      throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有折角，请编辑原记录');
-    }
 
     try {
-      const dogEar = await prisma.$transaction(async (tx) => {
+      const outcome = await prisma.$transaction(async (tx) => {
+        // 锁内复算页码边界，避免与并发的总页数调整交叉
+        await lockBookForUpdate(tx, bookId);
+        const book = await tx.book.findFirst({ where: { id: bookId, userId, deletedAt: null } });
+        if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
+        validateSinglePage(parsed.data.pageNumber, book.pageCount);
+        const existing = await tx.dogEar.findFirst({
+          where: { bookId, pageNumber: parsed.data.pageNumber, deletedAt: null }
+        });
+        if (existing) {
+          if ((existing.reason ?? '') === (reason ?? '')) {
+            return { idempotent: true as const, dogEar: existing };
+          }
+          throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有折角，请编辑原记录');
+        }
         const created = await tx.dogEar.create({
           data: { userId, bookId, pageNumber: parsed.data.pageNumber, reason }
         });
@@ -222,9 +225,12 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
           action: 'CREATED',
           payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) }
         });
-        return created;
+        return { idempotent: false as const, dogEar: created };
       });
-      return reply.status(201).send({ dogEar: serializeDogEar(dogEar) });
+      if (outcome.idempotent) {
+        return reply.status(200).send({ dogEar: serializeDogEar(outcome.dogEar), idempotent: true });
+      }
+      return reply.status(201).send({ dogEar: serializeDogEar(outcome.dogEar) });
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
         throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有折角，请编辑原记录');
@@ -238,27 +244,28 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const parsed = dogEarUpdateSchema.safeParse(request.body);
     if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '折角信息无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
-    const existing = await prisma.dogEar.findFirst({
-      where: { id, userId, deletedAt: null },
-      include: { book: true }
-    });
-    if (!existing || existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '折角不存在');
-    assertVersion(existing.version, parsed.data.version);
-    const nextPage = parsed.data.pageNumber ?? existing.pageNumber;
-    validateSinglePage(nextPage, existing.book.pageCount);
-    const nextReason =
-      parsed.data.reason === undefined
-        ? existing.reason
-        : parsed.data.reason
-          ? normalizeText(parsed.data.reason)
-          : null;
-    if (nextPage !== existing.pageNumber) {
-      const duplicate = await prisma.dogEar.findFirst({
-        where: { bookId: existing.bookId, pageNumber: nextPage, deletedAt: null, id: { not: id } }
-      });
-      if (duplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '目标页已有折角');
-    }
     const updated = await prisma.$transaction(async (tx) => {
+      const existing = await tx.dogEar.findFirst({ where: { id, userId, deletedAt: null } });
+      if (!existing) throw new AppError(404, 'NOT_FOUND', '折角不存在');
+      // 锁内重读书目，页码上界以锁定后的总页数为准
+      await lockBookForUpdate(tx, existing.bookId);
+      const book = await tx.book.findFirstOrThrow({ where: { id: existing.bookId } });
+      if (book.deletedAt) throw new AppError(404, 'NOT_FOUND', '折角不存在');
+      assertVersion(existing.version, parsed.data.version);
+      const nextPage = parsed.data.pageNumber ?? existing.pageNumber;
+      validateSinglePage(nextPage, book.pageCount);
+      const nextReason =
+        parsed.data.reason === undefined
+          ? existing.reason
+          : parsed.data.reason
+            ? normalizeText(parsed.data.reason)
+            : null;
+      if (nextPage !== existing.pageNumber) {
+        const duplicate = await tx.dogEar.findFirst({
+          where: { bookId: existing.bookId, pageNumber: nextPage, deletedAt: null, id: { not: id } }
+        });
+        if (duplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '目标页已有折角');
+      }
       const result = await tx.dogEar.updateMany({
         where: { id, userId, version: existing.version, deletedAt: null },
         data: {
@@ -310,17 +317,23 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
   app.post('/dog-ears/:dogEarId/restore', async (request) => {
     const id = parseId((request.params as { dogEarId: string }).dogEarId, 'dogEarId');
     const userId = currentUser(request).id;
-    const existing = await prisma.dogEar.findFirst({ where: { id, userId }, include: { book: true } });
-    if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除折角不存在');
-    if (!isRestoreWindowOpen(existing.deletedAt)) {
-      throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
-    }
-    if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
-    const duplicate = await prisma.dogEar.findFirst({
-      where: { bookId: existing.bookId, pageNumber: existing.pageNumber, deletedAt: null, id: { not: id } }
-    });
-    if (duplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有有效折角，无法恢复');
     const restored = await prisma.$transaction(async (tx) => {
+      const existing = await tx.dogEar.findFirst({ where: { id, userId } });
+      if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除折角不存在');
+      // 锁内复算：恢复相当于一次写入，必须满足当前总页数约束
+      await lockBookForUpdate(tx, existing.bookId);
+      const current = await tx.dogEar.findUniqueOrThrow({ where: { id } });
+      if (!current.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除折角不存在');
+      const book = await tx.book.findFirstOrThrow({ where: { id: existing.bookId } });
+      if (!isRestoreWindowOpen(current.deletedAt)) {
+        throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+      }
+      if (book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
+      assertRestorablePage(current.pageNumber, book.pageCount);
+      const duplicate = await tx.dogEar.findFirst({
+        where: { bookId: existing.bookId, pageNumber: current.pageNumber, deletedAt: null, id: { not: id } }
+      });
+      if (duplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有有效折角，无法恢复');
       const value = await tx.dogEar.update({
         where: { id },
         data: { deletedAt: null, version: { increment: 1 } }
@@ -343,10 +356,12 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const parsed = annotationCreateSchema.safeParse(request.body);
     if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '批注信息无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
-    const book = await prisma.book.findFirst({ where: { id: bookId, userId, deletedAt: null } });
-    if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
-    validatePageRange(parsed.data.startPage, parsed.data.endPage, book.pageCount);
     const annotation = await prisma.$transaction(async (tx) => {
+      // 锁内复算页码边界，避免与并发的总页数调整交叉
+      await lockBookForUpdate(tx, bookId);
+      const book = await tx.book.findFirst({ where: { id: bookId, userId, deletedAt: null } });
+      if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
+      validatePageRange(parsed.data.startPage, parsed.data.endPage, book.pageCount);
       const created = await tx.annotation.create({
         data: {
           userId,
@@ -374,16 +389,17 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const parsed = annotationUpdateSchema.safeParse(request.body);
     if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '批注信息无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
-    const existing = await prisma.annotation.findFirst({
-      where: { id, userId, deletedAt: null },
-      include: { book: true }
-    });
-    if (!existing || existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '批注不存在');
-    assertVersion(existing.version, parsed.data.version);
-    const startPage = parsed.data.startPage ?? existing.startPage;
-    const endPage = parsed.data.endPage ?? existing.endPage;
-    validatePageRange(startPage, endPage, existing.book.pageCount);
     const updated = await prisma.$transaction(async (tx) => {
+      const existing = await tx.annotation.findFirst({ where: { id, userId, deletedAt: null } });
+      if (!existing) throw new AppError(404, 'NOT_FOUND', '批注不存在');
+      // 锁内重读书目，页码上界以锁定后的总页数为准
+      await lockBookForUpdate(tx, existing.bookId);
+      const book = await tx.book.findFirstOrThrow({ where: { id: existing.bookId } });
+      if (book.deletedAt) throw new AppError(404, 'NOT_FOUND', '批注不存在');
+      assertVersion(existing.version, parsed.data.version);
+      const startPage = parsed.data.startPage ?? existing.startPage;
+      const endPage = parsed.data.endPage ?? existing.endPage;
+      validatePageRange(startPage, endPage, book.pageCount);
       const result = await tx.annotation.updateMany({
         where: { id, userId, deletedAt: null, version: existing.version },
         data: {
@@ -436,13 +452,19 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
   app.post('/annotations/:annotationId/restore', async (request) => {
     const id = parseId((request.params as { annotationId: string }).annotationId, 'annotationId');
     const userId = currentUser(request).id;
-    const existing = await prisma.annotation.findFirst({ where: { id, userId }, include: { book: true } });
-    if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除批注不存在');
-    if (!isRestoreWindowOpen(existing.deletedAt)) {
-      throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
-    }
-    if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     const restored = await prisma.$transaction(async (tx) => {
+      const existing = await tx.annotation.findFirst({ where: { id, userId } });
+      if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除批注不存在');
+      // 锁内复算：恢复相当于一次写入，必须满足当前总页数约束
+      await lockBookForUpdate(tx, existing.bookId);
+      const current = await tx.annotation.findUniqueOrThrow({ where: { id } });
+      if (!current.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除批注不存在');
+      const book = await tx.book.findFirstOrThrow({ where: { id: existing.bookId } });
+      if (!isRestoreWindowOpen(current.deletedAt)) {
+        throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+      }
+      if (book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
+      assertRestorablePage(current.endPage, book.pageCount);
       const value = await tx.annotation.update({
         where: { id },
         data: { deletedAt: null, version: { increment: 1 } }
@@ -465,10 +487,12 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const parsed = rereadCreateSchema.safeParse(request.body);
     if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '重读信息无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
-    const book = await prisma.book.findFirst({ where: { id: bookId, userId, deletedAt: null } });
-    if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
-    validateSinglePage(parsed.data.pageNumber, book.pageCount);
     const mark = await prisma.$transaction(async (tx) => {
+      // 锁内复算页码边界，避免与并发的总页数调整交叉
+      await lockBookForUpdate(tx, bookId);
+      const book = await tx.book.findFirst({ where: { id: bookId, userId, deletedAt: null } });
+      if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
+      validateSinglePage(parsed.data.pageNumber, book.pageCount);
       const created = await tx.rereadMark.create({
         data: {
           userId,
@@ -495,21 +519,22 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const parsed = rereadUpdateSchema.safeParse(request.body);
     if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '重读信息无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
-    const existing = await prisma.rereadMark.findFirst({
-      where: { id, userId, deletedAt: null },
-      include: { book: true }
-    });
-    if (!existing || existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '重读记录不存在');
-    assertVersion(existing.version, parsed.data.version);
-    const pageNumber = parsed.data.pageNumber ?? existing.pageNumber;
-    validateSinglePage(pageNumber, existing.book.pageCount);
-    const reason =
-      parsed.data.reason === undefined
-        ? existing.reason
-        : parsed.data.reason
-          ? normalizeText(parsed.data.reason)
-          : null;
     const updated = await prisma.$transaction(async (tx) => {
+      const existing = await tx.rereadMark.findFirst({ where: { id, userId, deletedAt: null } });
+      if (!existing) throw new AppError(404, 'NOT_FOUND', '重读记录不存在');
+      // 锁内重读书目，页码上界以锁定后的总页数为准
+      await lockBookForUpdate(tx, existing.bookId);
+      const book = await tx.book.findFirstOrThrow({ where: { id: existing.bookId } });
+      if (book.deletedAt) throw new AppError(404, 'NOT_FOUND', '重读记录不存在');
+      assertVersion(existing.version, parsed.data.version);
+      const pageNumber = parsed.data.pageNumber ?? existing.pageNumber;
+      validateSinglePage(pageNumber, book.pageCount);
+      const reason =
+        parsed.data.reason === undefined
+          ? existing.reason
+          : parsed.data.reason
+            ? normalizeText(parsed.data.reason)
+            : null;
       const result = await tx.rereadMark.updateMany({
         where: { id, userId, deletedAt: null, version: existing.version },
         data: { pageNumber, reason, version: { increment: 1 } }
@@ -557,13 +582,19 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
   app.post('/reread-marks/:rereadMarkId/restore', async (request) => {
     const id = parseId((request.params as { rereadMarkId: string }).rereadMarkId, 'rereadMarkId');
     const userId = currentUser(request).id;
-    const existing = await prisma.rereadMark.findFirst({ where: { id, userId }, include: { book: true } });
-    if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除重读记录不存在');
-    if (!isRestoreWindowOpen(existing.deletedAt)) {
-      throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
-    }
-    if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     const restored = await prisma.$transaction(async (tx) => {
+      const existing = await tx.rereadMark.findFirst({ where: { id, userId } });
+      if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除重读记录不存在');
+      // 锁内复算：恢复相当于一次写入，必须满足当前总页数约束
+      await lockBookForUpdate(tx, existing.bookId);
+      const current = await tx.rereadMark.findUniqueOrThrow({ where: { id } });
+      if (!current.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除重读记录不存在');
+      const book = await tx.book.findFirstOrThrow({ where: { id: existing.bookId } });
+      if (!isRestoreWindowOpen(current.deletedAt)) {
+        throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+      }
+      if (book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
+      assertRestorablePage(current.pageNumber, book.pageCount);
       const value = await tx.rereadMark.update({
         where: { id },
         data: { deletedAt: null, version: { increment: 1 } }

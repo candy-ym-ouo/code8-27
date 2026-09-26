@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { isRestoreWindowOpen, isStrictlyEditable, normalizeMoodTags, validatePageRange, validateStatusTransition } from './domain.js';
+import {
+  assertPageCountCoversTraces,
+  assertRestorablePage,
+  isRestoreWindowOpen,
+  isStrictlyEditable,
+  normalizeMoodTags,
+  validatePageRange,
+  validateSinglePage,
+  validateStatusTransition
+} from './domain.js';
 import { AppError } from './errors.js';
 
 describe('domain rules', () => {
@@ -17,6 +26,26 @@ describe('domain rules', () => {
     expect(() => validatePageRange(42, 44, 300)).not.toThrow();
     expect(() => validatePageRange(44, 42, 300)).toThrow(AppError);
     expect(() => validatePageRange(42, 301, 300)).toThrow(AppError);
+  });
+
+  it('validates single pages against the current page count', () => {
+    expect(() => validateSinglePage(300, 300)).not.toThrow();
+    expect(() => validateSinglePage(301, 300)).toThrow(AppError);
+    // 未填写总页数时不施加页码上界
+    expect(() => validateSinglePage(9999, null)).not.toThrow();
+  });
+
+  it('rejects shrinking page count below the maximum active trace page', () => {
+    expect(() => assertPageCountCoversTraces(100, 100)).not.toThrow();
+    expect(() => assertPageCountCoversTraces(100, 0)).not.toThrow();
+    expect(() => assertPageCountCoversTraces(99, 100)).toThrow(AppError);
+  });
+
+  it('blocks restoring a trace whose page is beyond the current page count', () => {
+    expect(() => assertRestorablePage(300, 300)).not.toThrow();
+    expect(() => assertRestorablePage(301, 300)).toThrow(AppError);
+    // 总页数被清空后恢复不再受上界阻挡
+    expect(() => assertRestorablePage(301, null)).not.toThrow();
   });
 
   it('normalizes mood tags and rejects empty or duplicate overrun', () => {

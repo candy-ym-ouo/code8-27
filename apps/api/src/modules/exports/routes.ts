@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma.js';
 import { AppError } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
@@ -17,47 +18,56 @@ export const exportRoutes: FastifyPluginAsync = async (app) => {
     const includeDeleted = String(query.includeDeleted ?? 'false').toLowerCase() === 'true';
     const filter = notDeletedFilter(includeDeleted);
 
-    const [booksCount, dogEarsCount, annotationsCount, rereadCount, reflectionsCount, eventsCount] =
-      await Promise.all([
-        prisma.book.count({ where: { userId, ...filter } }),
-        prisma.dogEar.count({ where: { userId, ...filter } }),
-        prisma.annotation.count({ where: { userId, ...filter } }),
-        prisma.rereadMark.count({ where: { userId, ...filter } }),
-        prisma.completionReflection.count({ where: { userId, ...filter } }),
-        prisma.activityEvent.count({ where: { userId } })
-      ]);
-    const totalRows =
-      booksCount + dogEarsCount + annotationsCount + rereadCount + reflectionsCount + eventsCount;
-    if (totalRows > env.EXPORT_MAX_ROWS) {
-      throw new AppError(413, 'EXPORT_TOO_LARGE', `导出数据超过 ${env.EXPORT_MAX_ROWS} 行限制`);
-    }
+    // 整个导出在单一 REPEATABLE READ 快照内完成，
+    // 计数与行内容、书目与痕迹都来自同一时刻，与存量口径一致。
+    const data = await prisma.$transaction(
+      async (tx) => {
+        const [booksCount, dogEarsCount, annotationsCount, rereadCount, reflectionsCount, eventsCount] =
+          await Promise.all([
+            tx.book.count({ where: { userId, ...filter } }),
+            tx.dogEar.count({ where: { userId, ...filter } }),
+            tx.annotation.count({ where: { userId, ...filter } }),
+            tx.rereadMark.count({ where: { userId, ...filter } }),
+            tx.completionReflection.count({ where: { userId, ...filter } }),
+            tx.activityEvent.count({ where: { userId } })
+          ]);
+        const totalRows =
+          booksCount + dogEarsCount + annotationsCount + rereadCount + reflectionsCount + eventsCount;
+        if (totalRows > env.EXPORT_MAX_ROWS) {
+          throw new AppError(413, 'EXPORT_TOO_LARGE', `导出数据超过 ${env.EXPORT_MAX_ROWS} 行限制`);
+        }
 
-    const [user, books, dogEars, annotations, rereadMarks, reflections, activityEvents] = await Promise.all([
-      prisma.user.findUniqueOrThrow({ where: { id: userId } }),
-      prisma.book.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
-      prisma.dogEar.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
-      prisma.annotation.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
-      prisma.rereadMark.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
-      prisma.completionReflection.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
-      prisma.activityEvent.findMany({ where: { userId }, orderBy: { occurredAt: 'asc' } })
-    ]);
+        const [user, books, dogEars, annotations, rereadMarks, reflections, activityEvents] = await Promise.all([
+          tx.user.findUniqueOrThrow({ where: { id: userId } }),
+          tx.book.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
+          tx.dogEar.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
+          tx.annotation.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
+          tx.rereadMark.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
+          tx.completionReflection.findMany({ where: { userId, ...filter }, orderBy: { createdAt: 'asc' } }),
+          tx.activityEvent.findMany({ where: { userId }, orderBy: { occurredAt: 'asc' } })
+        ]);
+        return { user, books, dogEars, annotations, rereadMarks, reflections, activityEvents };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead }
+    );
+
     const exportedAt = new Date();
     const payload = {
       schemaVersion: 1,
       exportedAt: exportedAt.toISOString(),
       includeDeleted,
       user: {
-        id: user.id,
-        email: user.email,
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt
+        id: data.user.id,
+        email: data.user.email,
+        createdAt: data.user.createdAt,
+        updatedAt: data.user.updatedAt
       },
-      books,
-      dogEars,
-      annotations,
-      rereadMarks,
-      reflections,
-      activityEvents
+      books: data.books,
+      dogEars: data.dogEars,
+      annotations: data.annotations,
+      rereadMarks: data.rereadMarks,
+      reflections: data.reflections,
+      activityEvents: data.activityEvents
     };
     const date = exportedAt.toISOString().slice(0, 10);
     reply
